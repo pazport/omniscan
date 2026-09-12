@@ -948,7 +948,9 @@ def init_ui(app, scanner):
                 "show_missing_only": show_missing_init,
                 "show_stuck_only": show_stuck_init,
                 "selected_paths": set(),
+                "page": 0,
             }
+            BROWSER_PAGE_SIZE = 50
 
             # ─── Header Row ───────────────────────────────────────────────────
             with ui.row().classes(
@@ -1006,6 +1008,7 @@ def init_ui(app, scanner):
                 state["show_missing_only"] = mode == "missing"
                 state["show_stuck_only"] = mode == "stuck"
                 state["selected_paths"] = set()
+                state["page"] = 0
                 if mode != "all":
                     state["current_path"] = ""
                     search_input.value = ""
@@ -1044,6 +1047,7 @@ def init_ui(app, scanner):
 
                         async def click_root():
                             state["current_path"] = ""
+                            state["page"] = 0
                             render_browser()
 
                         ui.button("Root", on_click=click_root).classes(
@@ -1057,6 +1061,7 @@ def init_ui(app, scanner):
 
                             async def click_part(path_val=current_acc):
                                 state["current_path"] = path_val
+                                state["page"] = 0
                                 render_browser()
 
                             ui.button(p, on_click=click_part).classes(
@@ -1115,6 +1120,7 @@ def init_ui(app, scanner):
 
                                     async def open_root(p_val=p):
                                         state["current_path"] = p_val
+                                        state["page"] = 0
                                         render_browser()
 
                                     ui.html(
@@ -1200,6 +1206,7 @@ def init_ui(app, scanner):
 
                             async def click_back():
                                 state["current_path"] = parent_path
+                                state["page"] = 0
                                 render_browser()
 
                             with files_container:
@@ -1258,6 +1265,20 @@ def init_ui(app, scanner):
                                 ).classes("text-xs text-slate-600")
                         return
 
+                    # Paginate — rendering every row is what makes this view crawl
+                    # (and can starve the websocket heartbeat) once a library has
+                    # hundreds/thousands of missing or stuck files.
+                    total_items = len(items)
+                    max_page = (
+                        (total_items - 1) // BROWSER_PAGE_SIZE if total_items else 0
+                    )
+                    if state["page"] > max_page:
+                        state["page"] = max_page
+                    if state["page"] < 0:
+                        state["page"] = 0
+                    page_start = state["page"] * BROWSER_PAGE_SIZE
+                    page_items = items[page_start : page_start + BROWSER_PAGE_SIZE]
+
                     # Summary bar
                     mode_label = (
                         "Missing Files"
@@ -1278,9 +1299,15 @@ def init_ui(app, scanner):
                         ui.label(f"{mode_label}").classes(
                             "text-xs font-black text-slate-400 uppercase tracking-widest"
                         )
-                        ui.label(
-                            f'{len(items)} item{"s" if len(items) != 1 else ""}'
-                        ).classes("text-xs text-slate-600")
+                        if total_items > BROWSER_PAGE_SIZE:
+                            ui.label(
+                                f"Showing {page_start + 1}-{min(page_start + BROWSER_PAGE_SIZE, total_items)} "
+                                f"of {total_items} items"
+                            ).classes("text-xs text-slate-600")
+                        else:
+                            ui.label(
+                                f'{total_items} item{"s" if total_items != 1 else ""}'
+                            ).classes("text-xs text-slate-600")
 
                     # Bulk actions row (only for missing/stuck modes)
                     if (
@@ -1408,7 +1435,7 @@ def init_ui(app, scanner):
                                                 not is_disabled
                                             )
 
-                    for it in items:
+                    for it in page_items:
                         it_path = it["path"]
                         is_dir = it["is_dir"]
                         name = it["name"]
@@ -1468,6 +1495,7 @@ def init_ui(app, scanner):
 
                                         async def click_folder(p_val=it_path):
                                             state["current_path"] = p_val
+                                            state["page"] = 0
                                             render_browser()
 
                                         ui.label(name).classes(
@@ -1619,8 +1647,33 @@ def init_ui(app, scanner):
                                         "rounded-xl border border-rose-500/20 font-bold text-xs px-3 py-1.5"
                                     )
 
+                    # Pagination controls
+                    if total_items > BROWSER_PAGE_SIZE:
+
+                        async def go_page(delta):
+                            state["page"] = max(0, state["page"] + delta)
+                            render_browser()
+
+                        with ui.row().classes(
+                            "w-full items-center justify-center gap-3 mt-4"
+                        ):
+                            ui.button(
+                                "Previous", on_click=lambda: go_page(-1)
+                            ).classes(
+                                "bg-white/5 hover:bg-white/10 text-slate-300 rounded-xl "
+                                "border border-white/5 font-bold text-xs px-4 py-2"
+                            ).set_enabled(state["page"] > 0)
+                            ui.label(
+                                f"Page {state['page'] + 1} of {max_page + 1}"
+                            ).classes("text-xs text-slate-500 font-semibold")
+                            ui.button("Next", on_click=lambda: go_page(1)).classes(
+                                "bg-white/5 hover:bg-white/10 text-slate-300 rounded-xl "
+                                "border border-white/5 font-bold text-xs px-4 py-2"
+                            ).set_enabled(state["page"] < max_page)
+
             async def on_search_change():
                 state["selected_paths"] = set()
+                state["page"] = 0
                 render_browser()
 
             render_browser()
