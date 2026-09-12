@@ -1210,36 +1210,38 @@ async def webhook_trigger(request: Request, apikey: Optional[str] = None):
         for p in paths_to_scan:
             if not p:
                 continue
-            # Retry logic for filesystem latency (e.g. rclone/union/zfs mounts).
-            # realpath() follows symlinks and mount points, so a file that was
-            # just imported may not resolve consistently against the scan
-            # roots (or exist at all) until the mount catches up - re-check
-            # both together instead of rejecting on the very first attempt.
-            scan_roots = scanner_instance.config.get("SCAN_PATHS", [])
-            normalized = os.path.realpath(p)
-            allowed = False
-            exists = False
-            for i in range(30):  # Increase to 30 seconds for slower mounts
-                normalized = os.path.realpath(p)
-                allowed = not scan_roots or any(
-                    normalized == os.path.realpath(root)
-                    or normalized.startswith(os.path.realpath(root) + os.sep)
-                    for root in scan_roots
-                )
-                if allowed and os.path.exists(normalized):
-                    exists = True
-                    break
-                if i % 5 == 0 and i > 0:
-                    logger.debug(f"Waiting for path to resolve/appear ({i}s): {p}")
-                await asyncio.sleep(1)
-
+            # Containment check: lexical (normpath) only, never realpath.
+            # Library files are commonly symlinks (Usenet/debrid mounts,
+            # union/zfs setups) pointing at a completely different path than
+            # the library tree - Plex/Jellyfin index the symlink path itself,
+            # not whatever it resolves to, so that's what must be validated
+            # and scanned. Resolving symlinks here would "correctly" trace
+            # the file back outside the scan roots and reject it every time.
+            scan_roots = [os.path.normpath(root) for root in scanner_instance.config.get("SCAN_PATHS", [])]
+            normalized = os.path.normpath(p)
+            allowed = not scan_roots or any(
+                normalized == root or normalized.startswith(root + os.sep)
+                for root in scan_roots
+            )
             if not allowed:
                 logger.warning(
-                    f"Rejected webhook path outside configured scan roots: {p} -> {normalized}"
+                    f"Rejected webhook path outside configured scan roots: {normalized}"
                 )
                 continue
             p = normalized
             logger.info(f"Webhook trigger for: {p}")
+
+            # Retry logic for filesystem latency (e.g. rclone/union/zfs mounts)
+            # - os.path.exists() follows symlinks transparently, so this also
+            # covers a symlink target that hasn't propagated into view yet.
+            exists = False
+            for i in range(30):  # Increase to 30 seconds for slower mounts
+                if os.path.exists(p):
+                    exists = True
+                    break
+                if i % 5 == 0 and i > 0:
+                    logger.debug(f"Waiting for path to appear ({i}s): {p}")
+                await asyncio.sleep(1)
 
             if exists:
                 if os.path.isfile(p):
