@@ -851,11 +851,6 @@ class PlexScanner:
                 total_count = data.get("TotalRecordCount", 0)
                 start_index += batch_count
 
-                # Clear large objects to free memory
-                del data
-                del items
-                gc.collect()
-
                 if batch_count < batch_size or start_index >= total_count:
                     break
 
@@ -1959,6 +1954,7 @@ class PlexScanner:
         for executor in (self.event_executor, self.scan_monitor_executor):
             executor.shutdown(wait=False, cancel_futures=True)
         self.http_session.close()
+        self.history.close()
 
     def _post_scan_process_file_delayed(self, file_path, delay=10):
         """Perform post-scan actions after a delayed sleep."""
@@ -2391,7 +2387,9 @@ class PlexScanner:
             self.is_scanning = True
         try:
             stats = RunStats(self.config)
-            tracker = StuckFileTracker(config=self.config)
+            tracker = StuckFileTracker(
+                db_file=self.config.get("HISTORY_DB", "history.db"), config=self.config
+            )
 
             # Use lock when clearing and re-filling cache
             with self.library_files_lock:
@@ -2563,6 +2561,8 @@ class PlexScanner:
             else:
                 logger.info("🧠 Retaining library cache for active watcher")
 
+            tracker.close()
+
             # Always trigger garbage collection to release memory from scan objects
             gc.collect()
 
@@ -2573,7 +2573,9 @@ class PlexScanner:
             from .models import RunStats, StuckFileTracker
 
             stats = RunStats(self.config)
-            tracker = StuckFileTracker(config=self.config)
+            tracker = StuckFileTracker(
+                db_file=self.config.get("HISTORY_DB", "history.db"), config=self.config
+            )
             folders_to_scan = set()
             folders_to_scan_lock = threading.Lock()
 
@@ -2613,6 +2615,7 @@ class PlexScanner:
             except Exception as e:
                 logger.error(f"Error during folder scan for {folder_path}: {e}")
             finally:
+                tracker.close()
                 gc.collect()
 
         threading.Thread(target=do_scan, daemon=True).start()
