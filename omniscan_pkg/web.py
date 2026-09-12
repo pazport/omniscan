@@ -817,6 +817,7 @@ async def update_settings(s: SettingsUpdate, u: str = Depends(get_current_user))
             "mappings",
             ",".join([f"{src}:{dst}" for src, dst in c["PATH_REWRITES"]]),
         )
+        cfg.set("scan", "directories", ",".join(c["SCAN_PATHS"]))
 
         with open("config.ini", "w") as f:
             cfg.write(f)
