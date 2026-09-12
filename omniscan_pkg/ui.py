@@ -2654,11 +2654,11 @@ def init_ui(app, scanner):
                             
                             interval_unit = c.get("RUN_INTERVAL_UNIT", "hours").lower()
                             interval = c.get("RUN_INTERVAL", 24)
-                            start_time = c.get("START_TIME", "")
-                            
-                            if start_time and interval_unit == "hours":
+                            sched_start_time = c.get("START_TIME", "")
+
+                            if sched_start_time and interval_unit == "hours":
                                 try:
-                                    start_hour, start_minute = map(int, start_time.split(":"))
+                                    start_hour, start_minute = map(int, sched_start_time.split(":"))
                                     for i in range(0, 24, interval):
                                         hour = (start_hour + i) % 24
                                         time_str = f"{hour:02d}:{start_minute:02d}"
