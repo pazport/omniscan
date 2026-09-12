@@ -1853,9 +1853,6 @@ def init_ui(app, scanner):
             "notification_group_window": c.get("NOTIFICATION_GROUP_WINDOW", 15),
             "ignore_patterns": "\n".join(c.get("IGNORE_PATTERNS", [])),
             "log_level": c.get("LOG_LEVEL", "INFO"),
-            "path_rewrites": "\n".join(
-                [f"{src}:{dst}" for src, dst in c.get("PATH_REWRITES", [])]
-            ),
             "cleanup_days": c.get("CLEANUP_DAYS", 10),
             "plex_analyze": c.get("PLEX_ANALYZE", False),
             "plex_refresh": c.get("PLEX_REFRESH", False),
@@ -2093,13 +2090,62 @@ def init_ui(app, scanner):
                         ui.label("Path Rewrites").classes(
                             "text-xs font-bold text-slate-400 uppercase tracking-wider"
                         )
-                        path_rewrites = (
-                            ui.textarea(
-                                value=values["path_rewrites"],
-                                placeholder="/source/path:/destination/path",
-                            )
-                            .classes("w-full font-mono")
-                            .props("outlined rows=3")
+                        ui.label(
+                            "Map a path as Sonarr/Radarr/etc. report it to the path Omniscan "
+                            "sees on disk. Add one row per app or library — e.g. one for "
+                            "Sonarr's TV path and another for Radarr's Movies path — or "
+                            "several rows for multiple Sonarr/Radarr instances."
+                        ).classes("text-[10px] text-slate-500 -mt-1")
+
+                        path_rewrites_container = ui.column().classes("w-full gap-2")
+                        path_rewrite_rows = []
+
+                        def add_rewrite_row(src_val="", dst_val=""):
+                            with path_rewrites_container:
+                                row = ui.row().classes("w-full gap-2 items-center")
+                                with row:
+                                    src_input = (
+                                        ui.input(
+                                            placeholder="/source/path (as the *arr app reports it)",
+                                        )
+                                        .classes("grow font-mono")
+                                        .props("outlined dense")
+                                    )
+                                    src_input.value = src_val
+                                    ui.html(
+                                        '<i class="fas fa-arrow-right text-slate-600 text-xs"></i>'
+                                    )
+                                    dst_input = (
+                                        ui.input(
+                                            placeholder="/destination/path (as Omniscan sees it)",
+                                        )
+                                        .classes("grow font-mono")
+                                        .props("outlined dense")
+                                    )
+                                    dst_input.value = dst_val
+                                    entry = {"row": row, "src": src_input, "dst": dst_input}
+
+                                    def remove_rewrite_row(entry=entry):
+                                        entry["row"].delete()
+                                        path_rewrite_rows.remove(entry)
+
+                                    ui.button(
+                                        icon="close", on_click=remove_rewrite_row
+                                    ).props("flat dense round").classes(
+                                        "text-rose-400 hover:text-rose-300"
+                                    )
+                            path_rewrite_rows.append(entry)
+
+                        for _src, _dst in c.get("PATH_REWRITES", []):
+                            add_rewrite_row(_src, _dst)
+                        if not path_rewrite_rows:
+                            add_rewrite_row()
+
+                        ui.button(
+                            "+ Add Mapping", on_click=lambda: add_rewrite_row()
+                        ).classes(
+                            "bg-white/5 hover:bg-white/10 text-slate-300 rounded-xl "
+                            "border border-white/5 font-bold text-xs px-4 py-2 self-start"
                         )
 
             # ─── SECTION 4: Scanner Behaviour ─────────────────────────────────
@@ -2494,15 +2540,11 @@ def init_ui(app, scanner):
                     c["WEB_AUTH_DISABLED"] = auth_disabled.value
 
                     c["PATH_REWRITES"] = []
-                    for line in path_rewrites.value.replace(",", "\n").split("\n"):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if ":" in line:
-                            parts = line.split(":", 1)
-                            c["PATH_REWRITES"].append(
-                                (parts[0].strip(), parts[1].strip())
-                            )
+                    for entry in path_rewrite_rows:
+                        src_val = entry["src"].value.strip() if entry["src"].value else ""
+                        dst_val = entry["dst"].value.strip() if entry["dst"].value else ""
+                        if src_val and dst_val:
+                            c["PATH_REWRITES"].append((src_val, dst_val))
 
                     try:
                         cfg = configparser.ConfigParser()
