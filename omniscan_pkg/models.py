@@ -5,7 +5,6 @@ import threading
 import logging
 from collections import defaultdict
 from datetime import datetime
-from contextlib import closing
 from .notifications import (
     truncate_field_value,
     send_discord_webhook_sync,
@@ -23,113 +22,152 @@ class StuckFileTracker:
         self.max_retries = self.config.get("MAX_RETRIES", 3)
         self.lock = threading.Lock()
         self.stuck_paths = set()
+        # path -> (size, mtime_ns), mirrors the integrity_quarantine table so
+        # is_quarantined() can answer without touching the database at all.
+        self.quarantine_cache = {}
+        self.conn = None
         self._init_db()
 
     def _init_db(self):
         self.prune_counter = 0
         with self.lock:
             try:
-                with closing(sqlite3.connect(self.db_file)) as conn:
-                    # Enable WAL mode for better concurrency
-                    conn.execute("PRAGMA journal_mode=WAL;")
-                    with conn:
-                        conn.execute("""
-                            CREATE TABLE IF NOT EXISTS stuck_files (
-                                path TEXT PRIMARY KEY,
-                                attempts INTEGER DEFAULT 0,
-                                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                            )
-                        """)
-                        conn.execute("""
-                            CREATE TABLE IF NOT EXISTS events (
-                                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                event_type TEXT,
-                                details TEXT,
-                                status TEXT,
-                                metadata TEXT
-                            )
-                        """)
-                        conn.execute("""
-                            CREATE TABLE IF NOT EXISTS integrity_quarantine (
-                                path TEXT PRIMARY KEY,
-                                size INTEGER NOT NULL,
-                                mtime_ns INTEGER NOT NULL,
-                                reason TEXT NOT NULL,
-                                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                            )
-                        """)
-                        # Migration: Add metadata column if it doesn't exist
-                        columns = [
-                            info[1]
-                            for info in conn.execute(
-                                "PRAGMA table_info(events)"
-                            ).fetchall()
-                        ]
-                        if "metadata" not in columns:
-                            conn.execute("ALTER TABLE events ADD COLUMN metadata TEXT")
-                            logger.info(
-                                "Database migrated: added 'metadata' column to 'events' table."
-                            )
+                # A single persistent connection is reused for the lifetime of the
+                # tracker instead of opening/closing a new one on every call - all
+                # access is already serialized by self.lock, so this is safe.
+                conn = sqlite3.connect(self.db_file, check_same_thread=False)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                with conn:
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS stuck_files (
+                            path TEXT PRIMARY KEY,
+                            attempts INTEGER DEFAULT 0,
+                            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS events (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            event_type TEXT,
+                            details TEXT,
+                            status TEXT,
+                            metadata TEXT
+                        )
+                    """)
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS integrity_quarantine (
+                            path TEXT PRIMARY KEY,
+                            size INTEGER NOT NULL,
+                            mtime_ns INTEGER NOT NULL,
+                            reason TEXT NOT NULL,
+                            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    # Migration: Add metadata column if it doesn't exist
+                    columns = [
+                        info[1]
+                        for info in conn.execute(
+                            "PRAGMA table_info(events)"
+                        ).fetchall()
+                    ]
+                    if "metadata" not in columns:
+                        conn.execute("ALTER TABLE events ADD COLUMN metadata TEXT")
+                        logger.info(
+                            "Database migrated: added 'metadata' column to 'events' table."
+                        )
 
-                    # Cache stuck paths in memory
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT path FROM stuck_files")
-                    self.stuck_paths = {row[0] for row in cursor.fetchall()}
+                    # Indexes for the queries the web UI/pruning hit repeatedly.
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_stuck_files_attempts ON stuck_files(attempts)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_stuck_files_last_seen ON stuck_files(last_seen)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type)"
+                    )
+
+                # Cache stuck paths and quarantine metadata in memory
+                cursor = conn.cursor()
+                cursor.execute("SELECT path FROM stuck_files")
+                self.stuck_paths = {row[0] for row in cursor.fetchall()}
+
+                cursor.execute("SELECT path, size, mtime_ns FROM integrity_quarantine")
+                self.quarantine_cache = {
+                    row[0]: (row[1], row[2]) for row in cursor.fetchall()
+                }
+
+                self.conn = conn
             except Exception as e:
                 logger.error(f"Failed to init DB: {e}")
+
+    def close(self):
+        """Release the persistent database connection."""
+        with self.lock:
+            if self.conn:
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
 
     def add_event(self, event_type, details, status, metadata=None):
         """Add an event to the history log, optionally storing rich metadata."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         metadata_json = json.dumps(metadata) if metadata else None
         with self.lock:
+            if not self.conn:
+                return
             try:
-                with closing(sqlite3.connect(self.db_file)) as conn:
-                    with conn:
-                        conn.execute(
-                            "INSERT INTO events (timestamp, event_type, details, status, metadata) VALUES (?, ?, ?, ?, ?)",
-                            (timestamp, event_type, details, status, metadata_json),
-                        )
+                with self.conn:
+                    self.conn.execute(
+                        "INSERT INTO events (timestamp, event_type, details, status, metadata) VALUES (?, ?, ?, ?, ?)",
+                        (timestamp, event_type, details, status, metadata_json),
+                    )
 
-                        # Prune old events and stuck files older than cleanup_days
-                        self.prune_counter += 1
-                        if self.prune_counter >= 100:
-                            cleanup_days = (
-                                self.config.get("CLEANUP_DAYS", 10)
-                                if hasattr(self, "config")
-                                else 10
-                            )
-                            conn.execute(
-                                "DELETE FROM events WHERE timestamp < datetime('now', ?)",
-                                (f"-{cleanup_days} days",),
-                            )
-                            conn.execute(
-                                "DELETE FROM stuck_files WHERE last_seen < datetime('now', ?)",
-                                (f"-{cleanup_days} days",),
-                            )
-                            self.prune_counter = 0
+                    # Prune old events and stuck files older than cleanup_days
+                    self.prune_counter += 1
+                    if self.prune_counter >= 100:
+                        cleanup_days = (
+                            self.config.get("CLEANUP_DAYS", 10)
+                            if hasattr(self, "config")
+                            else 10
+                        )
+                        self.conn.execute(
+                            "DELETE FROM events WHERE timestamp < datetime('now', ?)",
+                            (f"-{cleanup_days} days",),
+                        )
+                        self.conn.execute(
+                            "DELETE FROM stuck_files WHERE last_seen < datetime('now', ?)",
+                            (f"-{cleanup_days} days",),
+                        )
+                        self.prune_counter = 0
             except Exception as e:
                 logger.error(f"DB Error adding event: {e}")
 
     def get_history(self, limit=50, offset=0, search=None):
         """Get recent history events, optionally filtered by search term."""
         with self.lock:
+            if not self.conn:
+                return []
             try:
-                with closing(sqlite3.connect(self.db_file)) as conn:
-                    cursor = conn.cursor()
-                    if search:
-                        search_term = f"%{search}%"
-                        cursor.execute(
-                            "SELECT timestamp, event_type, details, status FROM events WHERE details LIKE ? OR event_type LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?",
-                            (search_term, search_term, limit, offset),
-                        )
-                    else:
-                        cursor.execute(
-                            "SELECT timestamp, event_type, details, status FROM events ORDER BY id DESC LIMIT ? OFFSET ?",
-                            (limit, offset),
-                        )
-                    return cursor.fetchall()
+                cursor = self.conn.cursor()
+                if search:
+                    search_term = f"%{search}%"
+                    cursor.execute(
+                        "SELECT timestamp, event_type, details, status FROM events WHERE details LIKE ? OR event_type LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                        (search_term, search_term, limit, offset),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT timestamp, event_type, details, status FROM events ORDER BY id DESC LIMIT ? OFFSET ?",
+                        (limit, offset),
+                    )
+                return cursor.fetchall()
             except Exception as e:
                 logger.error(f"DB Error fetching history: {e}")
                 return []
@@ -141,27 +179,28 @@ class StuckFileTracker:
     def increment_attempt(self, file_path):
         """Increment retry count for a file. Returns True if max retries exceeded."""
         with self.lock:
+            if not self.conn:
+                return False
             try:
-                with closing(sqlite3.connect(self.db_file)) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT attempts FROM stuck_files WHERE path = ?", (file_path,)
-                    )
-                    row = cursor.fetchone()
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT attempts FROM stuck_files WHERE path = ?", (file_path,)
+                )
+                row = cursor.fetchone()
 
-                    with conn:
-                        if row:
-                            attempts = row[0] + 1
-                            cursor.execute(
-                                "UPDATE stuck_files SET attempts = ?, last_seen = CURRENT_TIMESTAMP WHERE path = ?",
-                                (attempts, file_path),
-                            )
-                        else:
-                            attempts = 1
-                            cursor.execute(
-                                "INSERT INTO stuck_files (path, attempts) VALUES (?, ?)",
-                                (file_path, attempts),
-                            )
+                with self.conn:
+                    if row:
+                        attempts = row[0] + 1
+                        cursor.execute(
+                            "UPDATE stuck_files SET attempts = ?, last_seen = CURRENT_TIMESTAMP WHERE path = ?",
+                            (attempts, file_path),
+                        )
+                    else:
+                        attempts = 1
+                        cursor.execute(
+                            "INSERT INTO stuck_files (path, attempts) VALUES (?, ?)",
+                            (file_path, attempts),
+                        )
 
                 self.stuck_paths.add(file_path)
                 return attempts >= self.max_retries
@@ -174,17 +213,12 @@ class StuckFileTracker:
             file_stat = os.stat(file_path)
         except OSError:
             return False
+        # Answered entirely from the in-memory cache kept in sync by
+        # quarantine_integrity_failure()/clear_integrity_quarantine() - avoids a
+        # DB round trip for every file checked during a scan.
         with self.lock:
-            try:
-                with closing(sqlite3.connect(self.db_file)) as conn:
-                    row = conn.execute(
-                        "SELECT size, mtime_ns FROM integrity_quarantine WHERE path = ?",
-                        (file_path,),
-                    ).fetchone()
-                return bool(row and row == (file_stat.st_size, file_stat.st_mtime_ns))
-            except Exception as e:
-                logger.error(f"DB Error checking integrity quarantine: {e}")
-                return False
+            cached = self.quarantine_cache.get(file_path)
+            return bool(cached and cached == (file_stat.st_size, file_stat.st_mtime_ns))
 
     def quarantine_integrity_failure(self, file_path, reason):
         try:
@@ -192,37 +226,51 @@ class StuckFileTracker:
         except OSError:
             return
         with self.lock:
+            if not self.conn:
+                return
             try:
-                with closing(sqlite3.connect(self.db_file)) as conn:
-                    with conn:
-                        conn.execute(
-                            "INSERT OR REPLACE INTO integrity_quarantine "
-                            "(path, size, mtime_ns, reason, last_seen) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
-                            (file_path, file_stat.st_size, file_stat.st_mtime_ns, reason),
-                        )
+                with self.conn:
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO integrity_quarantine "
+                        "(path, size, mtime_ns, reason, last_seen) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                        (file_path, file_stat.st_size, file_stat.st_mtime_ns, reason),
+                    )
+                self.quarantine_cache[file_path] = (
+                    file_stat.st_size,
+                    file_stat.st_mtime_ns,
+                )
             except Exception as e:
                 logger.error(f"DB Error storing integrity quarantine: {e}")
 
     def clear_integrity_quarantine(self, file_path):
         with self.lock:
+            # Nothing to clear - skip the DB round trip entirely.
+            if file_path not in self.quarantine_cache:
+                return
+            if not self.conn:
+                return
             try:
-                with closing(sqlite3.connect(self.db_file)) as conn:
-                    with conn:
-                        conn.execute(
-                            "DELETE FROM integrity_quarantine WHERE path = ?", (file_path,)
-                        )
+                with self.conn:
+                    self.conn.execute(
+                        "DELETE FROM integrity_quarantine WHERE path = ?", (file_path,)
+                    )
+                self.quarantine_cache.pop(file_path, None)
             except Exception as e:
                 logger.error(f"DB Error clearing integrity quarantine: {e}")
 
     def clear_entry(self, file_path):
         """Remove file from history if it exists."""
         with self.lock:
+            # Nothing to clear - skip the DB round trip entirely.
+            if file_path not in self.stuck_paths:
+                return
+            if not self.conn:
+                return
             try:
-                with closing(sqlite3.connect(self.db_file)) as conn:
-                    with conn:
-                        conn.execute(
-                            "DELETE FROM stuck_files WHERE path = ?", (file_path,)
-                        )
+                with self.conn:
+                    self.conn.execute(
+                        "DELETE FROM stuck_files WHERE path = ?", (file_path,)
+                    )
                 self.stuck_paths.discard(file_path)
             except Exception as e:
                 logger.error(f"DB Error clearing {file_path}: {e}")
@@ -230,13 +278,14 @@ class StuckFileTracker:
     def get_all_stuck(self):
         """Return a list of all files with any retry attempts."""
         with self.lock:
+            if not self.conn:
+                return []
             try:
-                with closing(sqlite3.connect(self.db_file)) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT path, attempts, last_seen FROM stuck_files ORDER BY last_seen DESC"
-                    )
-                    return cursor.fetchall()
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT path, attempts, last_seen FROM stuck_files ORDER BY last_seen DESC"
+                )
+                return cursor.fetchall()
             except Exception as e:
                 logger.error(f"DB Error fetching stuck files: {e}")
                 return []
@@ -245,14 +294,15 @@ class StuckFileTracker:
         """Return only files that have exceeded max_retries — these are the genuinely stuck files
         that match what is reported in Discord notifications (stats.stuck_items)."""
         with self.lock:
+            if not self.conn:
+                return []
             try:
-                with closing(sqlite3.connect(self.db_file)) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT path, attempts, last_seen FROM stuck_files WHERE attempts >= ? ORDER BY last_seen DESC",
-                        (self.max_retries,),
-                    )
-                    return cursor.fetchall()
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT path, attempts, last_seen FROM stuck_files WHERE attempts >= ? ORDER BY last_seen DESC",
+                    (self.max_retries,),
+                )
+                return cursor.fetchall()
             except Exception as e:
                 logger.error(f"DB Error fetching truly stuck files: {e}")
                 return []
@@ -260,14 +310,15 @@ class StuckFileTracker:
     def get_truly_stuck_count(self):
         """Fast count of files with attempts >= max_retries."""
         with self.lock:
+            if not self.conn:
+                return 0
             try:
-                with closing(sqlite3.connect(self.db_file)) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT COUNT(*) FROM stuck_files WHERE attempts >= ?",
-                        (self.max_retries,),
-                    )
-                    return cursor.fetchone()[0]
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT COUNT(*) FROM stuck_files WHERE attempts >= ?",
+                    (self.max_retries,),
+                )
+                return cursor.fetchone()[0]
             except Exception as e:
                 logger.error(f"DB Error counting stuck files: {e}")
                 return 0
@@ -275,13 +326,14 @@ class StuckFileTracker:
     def get_corrupt_count(self):
         """Return the total number of corrupt files logged."""
         with self.lock:
+            if not self.conn:
+                return 0
             try:
-                with closing(sqlite3.connect(self.db_file)) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT COUNT(*) FROM events WHERE event_type = 'Corrupt'"
-                    )
-                    return cursor.fetchone()[0]
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT COUNT(*) FROM events WHERE event_type = 'Corrupt'"
+                )
+                return cursor.fetchone()[0]
             except Exception as e:
                 logger.error(f"DB Error fetching corrupt count: {e}")
                 return 0
@@ -289,10 +341,11 @@ class StuckFileTracker:
     def clear_all_stuck(self):
         """Clear all entries from the stuck files database."""
         with self.lock:
+            if not self.conn:
+                return False
             try:
-                with closing(sqlite3.connect(self.db_file)) as conn:
-                    with conn:
-                        conn.execute("DELETE FROM stuck_files")
+                with self.conn:
+                    self.conn.execute("DELETE FROM stuck_files")
                 self.stuck_paths.clear()
                 return True
             except Exception as e:
@@ -302,10 +355,11 @@ class StuckFileTracker:
     def clear_all_events(self):
         """Clear all entries from the events table."""
         with self.lock:
+            if not self.conn:
+                return False
             try:
-                with closing(sqlite3.connect(self.db_file)) as conn:
-                    with conn:
-                        conn.execute("DELETE FROM events")
+                with self.conn:
+                    self.conn.execute("DELETE FROM events")
                 return True
             except Exception as e:
                 logger.error(f"DB Error clearing all events: {e}")

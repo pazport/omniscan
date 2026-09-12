@@ -593,27 +593,35 @@ async def scan_library(r: LibraryScanRequest, u: str = Depends(get_current_user)
     return {"status": "success", "message": "Scan triggered"}
 
 
+def _do_test_connection(server_type, server_url, plex_server, token, api_key):
+    """Blocking connection probe - run off the event loop via run_in_executor
+    so a slow/unreachable server doesn't stall every connected client."""
+    if server_type == "plex":
+        plex = PlexServer(plex_server, token)
+        return {"status": "success", "message": f"Linked to {plex.friendlyName}"}
+    else:
+        _h = {
+            "X-Emby-Token": api_key,
+            "Authorization": f'MediaBrowser Token="{api_key}"',
+            "Accept": "application/json",
+        }
+        r = requests.get(f"{server_url}/System/Info", headers=_h, timeout=5)
+        r.raise_for_status()
+        return {
+            "status": "success",
+            "message": f"Linked to {server_type.capitalize()}",
+        }
+
+
 @app.post("/api/test-connection")
 async def test_conn(s: SettingsUpdate, u: str = Depends(get_current_user)):
     rt = unmask_v(s.plex_token, scanner_instance.config.get("TOKEN", ""))
     rk = unmask_v(s.api_key, scanner_instance.config.get("API_KEY", ""))
     ru = unmask_v(s.server_url, scanner_instance.config.get("SERVER_URL", ""))
     try:
-        if s.server_type == "plex":
-            plex = PlexServer(s.plex_server, rt)
-            return {"status": "success", "message": f"Linked to {plex.friendlyName}"}
-        else:
-            _h = {
-                "X-Emby-Token": rk,
-                "Authorization": f'MediaBrowser Token="{rk}"',
-                "Accept": "application/json",
-            }
-            r = requests.get(f"{ru}/System/Info", headers=_h, timeout=5)
-            r.raise_for_status()
-            return {
-                "status": "success",
-                "message": f"Linked to {s.server_type.capitalize()}",
-            }
+        return await asyncio.get_event_loop().run_in_executor(
+            None, _do_test_connection, s.server_type, ru, s.plex_server, rt, rk
+        )
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
 
@@ -625,21 +633,15 @@ async def test_conn_unauth(s: SettingsUpdate, request: Request):
     if is_setup_completed():
         raise HTTPException(status_code=403, detail="Forbidden")
     try:
-        if s.server_type == "plex":
-            plex = PlexServer(s.plex_server, s.plex_token)
-            return {"status": "success", "message": f"Linked to {plex.friendlyName}"}
-        else:
-            _h = {
-                "X-Emby-Token": s.api_key,
-                "Authorization": f'MediaBrowser Token="{s.api_key}"',
-                "Accept": "application/json",
-            }
-            r = requests.get(f"{s.server_url}/System/Info", headers=_h, timeout=5)
-            r.raise_for_status()
-            return {
-                "status": "success",
-                "message": f"Linked to {s.server_type.capitalize()}",
-            }
+        return await asyncio.get_event_loop().run_in_executor(
+            None,
+            _do_test_connection,
+            s.server_type,
+            s.server_url,
+            s.plex_server,
+            s.plex_token,
+            s.api_key,
+        )
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
 
@@ -1057,6 +1059,26 @@ async def validate_paths(data: dict, u: str = Depends(get_current_user)):
     return {"results": results}
 
 
+def _do_check_connection(server_type, url, token):
+    """Blocking connection probe - run off the event loop via run_in_executor."""
+    if server_type == "plex":
+        p = PlexServer(url, token)
+        return {"status": "success", "message": f"{p.friendlyName}", "server": "Plex"}
+    else:
+        h = {
+            "X-Emby-Token": token,
+            "Authorization": f'MediaBrowser Token="{token}"',
+            "Accept": "application/json",
+        }
+        r = requests.get(f"{url}/System/Info", headers=h, timeout=5)
+        r.raise_for_status()
+        return {
+            "status": "success",
+            "message": "Online",
+            "server": server_type.capitalize(),
+        }
+
+
 @app.post("/api/check-connection")
 async def check_conn_status(u: str = Depends(get_current_user)):
     if not scanner_instance:
@@ -1066,22 +1088,9 @@ async def check_conn_status(u: str = Depends(get_current_user)):
     url = c.get("PLEX_URL") if st == "plex" else c.get("SERVER_URL")
     token = c.get("TOKEN") if st == "plex" else c.get("API_KEY")
     try:
-        if st == "plex":
-            p = PlexServer(url, token)
-            return {
-                "status": "success",
-                "message": f"{p.friendlyName}",
-                "server": "Plex",
-            }
-        else:
-            h = {
-                "X-Emby-Token": token,
-                "Authorization": f'MediaBrowser Token="{token}"',
-                "Accept": "application/json",
-            }
-            r = requests.get(f"{url}/System/Info", headers=h, timeout=5)
-            r.raise_for_status()
-            return {"status": "success", "message": "Online", "server": st.capitalize()}
+        return await asyncio.get_event_loop().run_in_executor(
+            None, _do_check_connection, st, url, token
+        )
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
 
